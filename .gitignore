@@ -1,0 +1,10 @@
+# Godot 4+ specific ignores
+.godot/
+/android/
+*.uid
+
+# Music files — downloaded locally via yt_downloader.py
+assets/music/
+
+# Claude Code memory
+.claude/
