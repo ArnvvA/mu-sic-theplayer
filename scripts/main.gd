@@ -54,7 +54,11 @@ func _scan_music() -> Array:
 
 	for dir_name in DirAccess.get_directories_at(base):
 		var dir_path := base + dir_name + "/"
-		var files    := DirAccess.get_files_at(dir_path)
+		var files : Array[String] = []
+		for f in DirAccess.get_files_at(dir_path):
+			files.append(f)
+		files.sort_custom(func(a, b): return a.to_lower() < b.to_lower())
+		files.reverse()
 		for file in files:
 			var ext := file.get_extension().to_lower()
 			if ext in ["ogg", "mp3", "wav"]:
@@ -100,6 +104,7 @@ func _process(dt: float) -> void:
 
 	for i in deck_cards.size():
 		deck_cards[i].z_index = i
+		deck_cards[i].get_node("TitleLabel").visible = (i == deck_cards.size() - 1)
 	var off_z := deck_cards.size()
 	for card in all_cards:
 		if not card.is_on_deck and not card.dragging:

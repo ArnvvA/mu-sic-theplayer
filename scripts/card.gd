@@ -37,18 +37,11 @@ func set_card_texture(path: String, size: Vector2) -> void:
 	front_texture = tex
 	card_size = size
 
-	var card_sprite   := $Sprite2D
-	var border_sprite := get_node_or_null("BorderSprite")
+	var card_sprite := $Sprite2D
 
-	card_sprite.texture = tex
-	card_sprite.scale   = _fit_scale(tex, size)
+	card_sprite.texture  = tex
+	card_sprite.scale    = _fit_scale(tex, size)
 	card_sprite.position = size / 2.0
-
-	# Scale border based on its own texture size, not the card's
-	if border_sprite and border_sprite.texture:
-		border_sprite.scale    = _fit_scale(border_sprite.texture, size)
-		border_sprite.position = size / 2.0
-		border_sprite.z_index  = 1
 
 
 func set_back_texture(path: String) -> void:
