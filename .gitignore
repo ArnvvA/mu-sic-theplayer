@@ -8,3 +8,6 @@ assets/music/
 
 # Claude Code memory
 .claude/
+
+# YouTube session cookies — never commit
+cookies.txt
