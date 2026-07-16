@@ -11,3 +11,9 @@ assets/music/
 
 # YouTube session cookies — never commit
 cookies.txt
+
+# Godot editor git plugin (not part of the app)
+addons/
+
+# Original reference template (lua/love2d), kept for reference only
+lua cards template/
