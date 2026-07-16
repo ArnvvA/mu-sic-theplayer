@@ -2,7 +2,6 @@ extends Node2D
 
 const CARD_SIZE          : float = 240.0
 const CLICK_THRESHOLD    : float = 8.0
-const DOUBLE_CLICK_TIME  : float = 0.30
 
 # Main screen grid
 const GRID_COLS          : int    = 4
@@ -20,6 +19,10 @@ const PLAYER_QUEUE_GAP   : float = 50.0
 
 # Generous drop target for the slot
 const SLOT_DROP_MARGIN   : float = 80.0
+
+# Slot card hitbox split: inside this circle (from the card centre) = pick it up
+# to move it; outside it but still on the card = grab to spin it.
+const SLOT_INNER_RADIUS  : float = 70.0
 
 # Retract offset when decks slide off-screen
 const RETRACT_OFFSET_X   : float = 2400.0
@@ -39,6 +42,10 @@ var playing_deck          = null
 var playing_index : int   = 0
 var slot_card             = null
 var hover_card            = null
+var _slot_fx_card         = null    # card currently showing the 3D slot effect
+var _rotating     : bool   = false  # spinning the slot card via its outer ring?
+var _press_region : String = ""     # "inner"/"outer": where the slot card was grabbed
+var _last_rot_x   : float  = 0.0    # mouse x last frame, used to measure spin delta
 
 var _press_card           = null
 var _press_pos  : Vector2 = Vector2.ZERO
@@ -46,6 +53,22 @@ var _drag_active : bool   = false
 
 var _audio_player : AudioStreamPlayer
 var sound_queue   : Array = []
+
+# Custom background wallpaper. background_tex is null until you pick one (press B),
+# in which case _draw() paints it instead of the plain colour. The chosen path is
+# remembered in user://settings.cfg so it comes back next time you open the app.
+const SETTINGS_PATH := "user://settings.cfg"
+const BACKGROUND_DIM := 0.4   # darkening over a wallpaper, 0 = none, 1 = solid black
+var background_tex : Texture2D = null
+var _bg_dialog     : FileDialog
+
+# Idle/redraw control. We only repaint the background _draw when something it
+# actually shows changes, and we freeze the slot spin/bob while the window is in
+# the background — so the GPU goes idle instead of redrawing nothing 15x a second.
+var _focused           := true
+var _last_filled       := false
+var _last_playing_deck = null
+var _last_screen       := Vector2.ZERO
 
 
 func _ready() -> void:
@@ -58,15 +81,20 @@ func _ready() -> void:
 	add_child(_audio_player)
 
 	_build_decks()
+	_setup_background_dialog()
+	_load_background()
 
-	Engine.max_fps = 60
+	Engine.max_fps = 120
 
 
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_APPLICATION_FOCUS_OUT:
 		Engine.max_fps = 15
+		_focused = false
 	elif what == NOTIFICATION_APPLICATION_FOCUS_IN:
-		Engine.max_fps = 60
+		Engine.max_fps = 120
+		_focused = true
+		queue_redraw()   # repaint once on return in case anything changed
 
 
 # ── Scan & build ──────────────────────────────────────────────────────────────
@@ -140,6 +168,13 @@ func _parse_title(filename: String, artist: String = "") -> String:
 	var first_sep := base.find(" - ")
 	if first_sep != -1 and base.substr(0, first_sep).strip_edges().is_valid_int():
 		base = base.substr(first_sep + 3)
+
+	# Strip legacy album-prefix patterns like "<noise> (Track NN) - ".
+	var track_re := RegEx.new()
+	track_re.compile("^.*\\(Track\\s*\\d+\\)\\s*-\\s*")
+	var track_m := track_re.search(base)
+	if track_m:
+		base = base.substr(track_m.get_end())
 
 	# Strip leading "Artist - " if it matches the album's artist.
 	if artist != "" and base.to_lower().begins_with(artist.to_lower() + " - "):
@@ -264,8 +299,9 @@ func _compute_target(card) -> Vector2:
 		var dir_sign := 1.0 if deck.home_pos.x >= fanned_deck.home_pos.x else -1.0
 		return deck.home_pos + Vector2(dir_sign * RETRACT_OFFSET_X, 0)
 
-	var i = deck.cards.find(card)
-	return deck.home_pos + Vector2(-0.25, 0.25) * i
+	# Home stack: every card sits flush at the same spot, so the deck reads as one
+	# clean card. (Z-order in _compute_z still keeps the top card drawn on top.)
+	return deck.home_pos
 
 
 func _fan_pos(card) -> Vector2:
@@ -318,6 +354,21 @@ func _compute_z(card) -> int:
 	return 1000 - i
 
 
+# Whether a card should actually be drawn. In a resting home stack only the top
+# card is visible — the rest sit exactly behind it, so rendering them just stacks
+# their anti-aliased rounded corners into a faint squared-off halo. Hiding them
+# keeps the corners clean (and saves drawing cards nobody can see).
+func _card_visible(card) -> bool:
+	if card.dragging or card == slot_card or card == hover_card:
+		return true
+	var deck = card.deck
+	if playing_deck != null and deck == playing_deck:
+		return true
+	if fanned_deck != null and deck == fanned_deck:
+		return true
+	return card == _home_top(deck)
+
+
 func _label_visible(card) -> bool:
 	if card == hover_card:
 		return true
@@ -328,7 +379,7 @@ func _label_visible(card) -> bool:
 		return card == playing_deck.cards[playing_index]
 	if fanned_deck != null and deck == fanned_deck:
 		return true
-	if fanned_deck == null and deck.cards[0] == card:
+	if fanned_deck == null and card == _home_top(deck):
 		return true
 	return false
 
@@ -339,7 +390,7 @@ func _label_text(card) -> String:
 	if not card.dragging and card != slot_card \
 			and (playing_deck == null or deck != playing_deck) \
 			and (fanned_deck == null or deck != fanned_deck) \
-			and deck.cards[0] == card:
+			and card == _home_top(deck):
 		return deck.name
 	return card.song_title
 
@@ -357,11 +408,13 @@ func _process(dt: float) -> void:
 			card.target_pos = _compute_target(card)
 		card.move(dt)
 		card.z_index = _compute_z(card)
+		card.visible = _card_visible(card)
 		var vis := _label_visible(card)
-		card.get_node("TitleLabel").visible = vis
-		card.get_node("TitlePanel").visible = vis
+		card.set_label_shown(vis)
 		if vis:
 			card.get_node("TitleLabel").text = _label_text(card)
+
+	_update_slot_fx(dt)
 
 	var i := 0
 	while i < sound_queue.size():
@@ -372,13 +425,104 @@ func _process(dt: float) -> void:
 		else:
 			i += 1
 
-	queue_redraw()
+	_refresh_background_if_changed()
+
+
+# Repaint the background _draw only when one of the things it actually shows has
+# changed: whether the slot is filled, which deck is playing, or the canvas size
+# (e.g. resize / fullscreen). The cards repaint themselves as they move, so we no
+# longer redraw every frame — when nothing changes, the GPU has nothing to do.
+func _refresh_background_if_changed() -> void:
+	var filled := slot_card != null or playing_deck != null
+	var screen : Vector2 = get_viewport_rect().size
+	if filled != _last_filled \
+			or playing_deck != _last_playing_deck \
+			or screen != _last_screen:
+		_last_filled       = filled
+		_last_playing_deck = playing_deck
+		_last_screen       = screen
+		queue_redraw()
+
+
+# ── Player-slot 3D effect ─────────────────────────────────────────────────────
+
+# Which card is "in the slot" right now? Either a single song you dropped there
+# (slot_card), or, when a whole deck is playing, the current track at the top of
+# the queue. Returns null if the slot is empty.
+func _slot_occupant():
+	if slot_card != null:
+		return slot_card
+	if playing_deck != null:
+		return playing_deck.cards[playing_index]
+	return null
+
+# Hands the 3D tilt effect to whichever card should have it, and takes it away
+# from any card that shouldn't. Runs once per frame from _process.
+func _update_slot_fx(dt: float) -> void:
+	# In the background, freeze the effect entirely. Nothing can change the slot
+	# occupant without focus (that needs input), so we just stop advancing the
+	# spin/bob — which stops the slot card requesting a redraw every frame.
+	if not _focused:
+		return
+
+	var want = _slot_occupant()
+
+	# Keep the effect on a card while you're physically dragging it. (Grabbing the
+	# slot card clears slot_card immediately, so without this the effect would
+	# vanish the instant you picked it up — but dragging it is exactly when we
+	# most want the lean.)
+	if _slot_fx_card != null and _slot_fx_card.dragging:
+		want = _slot_fx_card
+
+	# Hand-off: only touch cards when the owner actually changes.
+	if want != _slot_fx_card:
+		if _slot_fx_card != null:
+			_slot_fx_card.set_slot_active(false)
+		_slot_fx_card = want
+		if _slot_fx_card != null:
+			_slot_fx_card.set_slot_active(true)
+
+	if _slot_fx_card == null:
+		return
+
+	# While the outer ring is held, measure how far the mouse moved horizontally
+	# this frame and pass it on so the card turns to follow.
+	var dx := 0.0
+	if _rotating:
+		var mx : float = get_viewport().get_mouse_position().x
+		dx = mx - _last_rot_x
+		_last_rot_x = mx
+
+	# Is a song actually playing right now? (A loaded stream that isn't paused.)
+	# The card spins at full idle speed when playing, slower when paused.
+	var playing : bool = _audio_player.stream != null and not _audio_player.stream_paused
+	_slot_fx_card.update_slot_visual(dt, _rotating, dx, playing)
 
 
 # ── Drawing ───────────────────────────────────────────────────────────────────
 
 func _draw() -> void:
-	draw_rect(Rect2(Vector2.ZERO, Vector2(1920, 1080)), Color(0.88, 0.92, 0.88, 1.0))
+	# Use the real visible canvas size, not a hardcoded 1920x1080. With the
+	# keep_height stretch the height stays 1080 but the width grows to match the
+	# monitor, so this makes the wallpaper/background cover the whole screen.
+	var screen : Vector2 = get_viewport_rect().size
+	if background_tex != null:
+		# "Cover" fit: scale the image so it fills the whole screen, then sample a
+		# centred region the shape of the screen. This fills edge-to-edge with no
+		# stretching — the overflow on the long side is simply cropped off.
+		var ts : Vector2 = background_tex.get_size()
+		var scale : float = maxf(screen.x / ts.x, screen.y / ts.y)
+		var src_size : Vector2 = screen / scale
+		var src_pos  : Vector2 = (ts - src_size) / 2.0
+		draw_texture_rect_region(
+			background_tex,
+			Rect2(Vector2.ZERO, screen),
+			Rect2(src_pos, src_size)
+		)
+		# Dim veil over the wallpaper so the cards stand out against busy images.
+		draw_rect(Rect2(Vector2.ZERO, screen), Color(0, 0, 0, BACKGROUND_DIM))
+	else:
+		draw_rect(Rect2(Vector2.ZERO, screen), Color(0.88, 0.92, 0.88, 1.0))
 
 	var slot_rect := Rect2(PLAYER_SLOT_POS, Vector2(CARD_SIZE, CARD_SIZE))
 	var filled := slot_card != null or playing_deck != null
@@ -398,11 +542,70 @@ func _draw() -> void:
 		draw_rect(ph, Color(0.4, 0.5, 0.4, 0.4), false, 1.5)
 
 
+# ── Background wallpaper ──────────────────────────────────────────────────────
+
+# Create the file picker once, up front. Pressing B later just pops it open.
+func _setup_background_dialog() -> void:
+	_bg_dialog = FileDialog.new()
+	_bg_dialog.access           = FileDialog.ACCESS_FILESYSTEM   # browse the whole disk
+	_bg_dialog.file_mode        = FileDialog.FILE_MODE_OPEN_FILE # pick one existing file
+	_bg_dialog.use_native_dialog = true                         # the real Windows picker
+	_bg_dialog.filters = PackedStringArray([
+		"*.png, *.jpg, *.jpeg, *.webp, *.bmp ; Images"
+	])
+	_bg_dialog.file_selected.connect(_on_background_chosen)
+	add_child(_bg_dialog)
+
+
+# Runs when you actually pick a file in the dialog. Loads it, shows it, saves it.
+func _on_background_chosen(path: String) -> void:
+	if _apply_background(path):
+		_save_background(path)
+
+
+# Load an image from anywhere on disk and turn it into our background texture.
+# Returns true on success so callers know whether to remember the path.
+func _apply_background(path: String) -> bool:
+	var img := Image.new()
+	if img.load(path) != OK:
+		return false
+	background_tex = ImageTexture.create_from_image(img)
+	queue_redraw()   # ask Godot to repaint so the new wallpaper shows immediately
+	return true
+
+
+func _save_background(path: String) -> void:
+	var cfg := ConfigFile.new()
+	cfg.load(SETTINGS_PATH)            # keep any other settings already in the file
+	cfg.set_value("background", "path", path)
+	cfg.save(SETTINGS_PATH)
+
+
+func _load_background() -> void:
+	var cfg := ConfigFile.new()
+	if cfg.load(SETTINGS_PATH) != OK:
+		return
+	var path : String = cfg.get_value("background", "path", "")
+	if path != "" and FileAccess.file_exists(path):
+		_apply_background(path)
+
+
 # ── Input ─────────────────────────────────────────────────────────────────────
 
 func _input(event: InputEvent) -> void:
 	if event is InputEventKey and event.pressed and event.keycode == KEY_ESCAPE:
 		_on_escape()
+		return
+	# B opens the wallpaper picker. not event.echo ignores key-repeat while held.
+	if event is InputEventKey and event.pressed and not event.echo \
+			and event.keycode == KEY_B:
+		_bg_dialog.popup_centered(Vector2i(1000, 700))
+		return
+	# Space toggles play/pause, same as clicking the slot card. _toggle_pause
+	# already does nothing when no song is loaded, so this is safe any time.
+	if event is InputEventKey and event.pressed and not event.echo \
+			and event.keycode == KEY_SPACE:
+		_toggle_pause()
 		return
 	if event is InputEventKey and event.pressed and event.keycode == KEY_F11:
 		var mode := DisplayServer.window_get_mode()
@@ -484,9 +687,11 @@ func _on_press(pos: Vector2) -> void:
 
 	for card in sorted:
 		if _card_rect(card).has_point(pos):
-			_press_card  = card
-			_press_pos   = pos
-			_drag_active = false
+			_press_card   = card
+			_press_pos    = pos
+			_drag_active  = false
+			# Only the slot card cares about inner vs outer; everything else is "".
+			_press_region = _slot_region(card, pos) if card == _slot_occupant() else ""
 			return
 
 	_press_card = null
@@ -501,6 +706,14 @@ func _on_motion(pos: Vector2) -> void:
 		return
 
 	var card = _press_card
+
+	# Slot card grabbed by the OUTER ring → spin it in place. Don't pick it up,
+	# don't clear the slot, don't stop the music — just start rotating.
+	if card == _slot_occupant() and _press_region == "outer":
+		_drag_active = true
+		_rotating    = true
+		_last_rot_x  = pos.x
+		return
 
 	# Queued (non-current) cards aren't draggable — cancel the gesture.
 	if playing_deck != null and card.deck == playing_deck:
@@ -520,6 +733,15 @@ func _on_motion(pos: Vector2) -> void:
 
 
 func _on_release(pos: Vector2) -> void:
+	# Finishing a spin: just stop steering it. The card keeps whatever spin
+	# momentum it had and coasts back to the idle rotation. This is not a click,
+	# so it must not toggle pause.
+	if _rotating:
+		_rotating    = false
+		_drag_active = false
+		_press_card  = null
+		return
+
 	if _press_card == null:
 		return
 	var card = _press_card
@@ -553,24 +775,16 @@ func _handle_click(card) -> void:
 			_play_current()
 		return
 
-	var now       : float = Time.get_ticks_msec() / 1000.0
-	var is_double : bool  = (now - card.last_click_time) < DOUBLE_CLICK_TIME
-	card.last_click_time = 0.0 if is_double else now
-
 	var deck = card.deck
 
+	# Fanned deck → tap a card to play it on its own.
 	if fanned_deck != null and deck == fanned_deck:
-		if is_double:
-			_play_deck(deck, deck.cards.find(card))
-		else:
-			_play_single(card)
+		_play_single(card)
 		return
 
-	if fanned_deck == null and deck.cards[0] == card:
-		if is_double:
-			_play_deck(deck, 0)
-		else:
-			fanned_deck = deck
+	# Home stack → tap the top card to fan the deck open.
+	if fanned_deck == null and card == _home_top(deck):
+		fanned_deck = deck
 
 
 func _toggle_pause() -> void:
@@ -589,6 +803,23 @@ func _handle_drop(card, pos: Vector2) -> void:
 
 func _card_rect(card) -> Rect2:
 	return Rect2(card.position, Vector2(CARD_SIZE, CARD_SIZE))
+
+
+# The card actually sitting on top of a deck's home stack. Usually cards[0], but
+# when the first song is playing as a single it has flown to the player slot, so
+# the next card is the real top. Returns null only if every card has left home.
+func _home_top(deck):
+	for c in deck.cards:
+		if c != slot_card:
+			return c
+	return null
+
+
+func _slot_region(card, pos: Vector2) -> String:
+	# Which zone of the slot card was grabbed: the centre circle (pick up / move)
+	# or the ring around it (spin). Decided by distance from the card's centre.
+	var center : Vector2 = card.position + Vector2(CARD_SIZE, CARD_SIZE) / 2.0
+	return "inner" if pos.distance_to(center) <= SLOT_INNER_RADIUS else "outer"
 
 
 func _slot_drop_rect() -> Rect2:
