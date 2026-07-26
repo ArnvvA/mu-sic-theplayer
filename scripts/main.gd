@@ -8,6 +8,14 @@ const GRID_COLS          : int    = 4
 const GRID_START         := Vector2(80, 80)
 const GRID_PITCH         := Vector2(320, 320)
 
+# Grid scrolling. The grid shows VISIBLE_ROWS rows at a time; scrolling shifts by
+# whole rows — the exiting row swishes off one edge while the entering row rises
+# in from the other. A shift fires once enough wheel input accumulates, and the
+# accumulator decays so stale half-notches don't trigger a surprise scroll later.
+const VISIBLE_ROWS         : int   = 3
+const SCROLL_TICKS_PER_ROW : float = 1.5   # wheel notches needed per row shift
+const SCROLL_DECAY         : float = 1.0   # accumulated notches that fade per second
+
 # Fan-out layout
 const FAN_SPREAD_MAX     : float = 1400.0
 const FAN_CENTER_Y       : float = 540.0
@@ -16,6 +24,19 @@ const FAN_CARD_PITCH     : float = 260.0
 # Player tab (right side)
 const PLAYER_SLOT_POS    := Vector2(1620, 80)
 const PLAYER_QUEUE_GAP   : float = 50.0
+
+# Long-queue handling, two mechanisms that compose:
+# 1) the sliver gap compresses (down to QUEUE_GAP_MIN) so the queue fits above
+#    the progress bar; 2) if even that can't fit everything, the queue becomes
+#    scrollable — wheel over the queue column shifts it, same feel as the grid.
+const QUEUE_GAP_MIN      : float = 16.0
+const QUEUE_BOTTOM_PAD   : float = 90.0   # queue keeps clear of the bar AND its
+										  # title/timer text row (even when the
+										  # hover fisheye nudges cards down 18px)
+
+# Hover fisheye: cards after the hovered one nudge down to open a gap around
+# the sliver the popped card vacated.
+const HOVER_NUDGE        : float = 18.0
 
 # Generous drop target for the slot
 const SLOT_DROP_MARGIN   : float = 80.0
@@ -29,6 +50,19 @@ const RETRACT_OFFSET_X   : float = 2400.0
 
 # Hover-pop offset for queued cards
 const HOVER_OFFSET       := Vector2(-260.0, 0.0)
+
+# Progress bar — a full-width strip across the very bottom of the app. Always
+# shows the CURRENT track's timeline; a track with chapters (a YouTube full-album
+# video is one file with chapter splits) draws those splits as segments.
+const BOTTOM_BAND        : float = 0   # dark scrim height behind the bar
+const BAR_MARGIN_X       : float = 48.0    # left/right inset of the bar itself
+const BAR_BOTTOM_OFFSET  : float = 34.0    # bar centre, measured up from the bottom
+const BAR_HEIGHT         : float = 6.0     # bar thickness
+const KNOB_RADIUS        : float = 8.0     # draggable playhead knob
+const CHAPTER_GAP        : float = 4.0     # gap drawn between chapter segments
+const BAR_HIT_HEIGHT     : float = 30.0    # click/scrub grab band around the bar
+const TRACK_COLOR        := Color(1, 1, 1, 0.11)              # unplayed portion
+const FILL_COLOR         := Color(0.001, 0.103, 0.146, 0.3)      # played portion (cyan)
 
 var card_scene    : PackedScene
 var card_sound    : AudioStream
@@ -50,6 +84,19 @@ var _last_rot_x   : float  = 0.0    # mouse x last frame, used to measure spin d
 var _press_card           = null
 var _press_pos  : Vector2 = Vector2.ZERO
 var _drag_active : bool   = false
+
+# Progress-bar scrubbing. While _scrubbing, the playhead follows the mouse and the
+# bar shows _scrub_time; the actual audio seek happens once, on release.
+var _scrubbing  : bool  = false
+var _scrub_time : float = 0.0
+
+# Grid scroll state: which row of the deck grid is at the top of the screen.
+var scroll_row    : int   = 0
+var _scroll_accum : float = 0.0   # signed wheel input building toward a row shift
+
+# Queue scroll state: how many upcoming cards are tucked away above the window.
+# Only ever non-zero when the queue overflows even at QUEUE_GAP_MIN.
+var queue_scroll  : int   = 0
 
 var _audio_player : AudioStreamPlayer
 var sound_queue   : Array = []
@@ -106,6 +153,7 @@ func _build_decks() -> void:
 		var album_dir = "res://assets/music/" + info.name + "/"
 		var cover     = _load_cover(album_dir)
 		var meta      = _load_meta(album_dir)
+		var chapters_map : Dictionary = meta.get("chapters", {})
 
 		var deck = {
 			"name":     meta.get("album", info.name),
@@ -121,6 +169,7 @@ func _build_decks() -> void:
 			card.set_cover(cover, Vector2(CARD_SIZE, CARD_SIZE))
 			card.set_title(_parse_title(song.file, deck.artist))
 			card.song_path = song.path
+			card.chapters = chapters_map.get(song.file, [])
 			card.deck = deck
 			all_cards.append(card)
 			deck.cards.append(card)
@@ -290,6 +339,11 @@ func _compute_target(card) -> Vector2:
 		var p := _player_queue_pos(card)
 		if card == hover_card:
 			p += HOVER_OFFSET
+		elif hover_card != null and hover_card.deck == playing_deck \
+				and _queue_offset(card) > _queue_offset(hover_card):
+			# Fisheye: cards after the hovered one nudge down, opening a gap
+			# around the sliver the popped card vacated.
+			p.y += HOVER_NUDGE
 		return p
 
 	if fanned_deck != null and deck == fanned_deck:
@@ -297,11 +351,29 @@ func _compute_target(card) -> Vector2:
 
 	if fanned_deck != null:
 		var dir_sign := 1.0 if deck.home_pos.x >= fanned_deck.home_pos.x else -1.0
-		return deck.home_pos + Vector2(dir_sign * RETRACT_OFFSET_X, 0)
+		return _scrolled_home(deck) + Vector2(dir_sign * RETRACT_OFFSET_X, 0)
 
 	# Home stack: every card sits flush at the same spot, so the deck reads as one
 	# clean card. (Z-order in _compute_z still keeps the top card drawn on top.)
-	return deck.home_pos
+	return _scrolled_home(deck)
+
+
+# A deck's on-screen home position given the current scroll. Rows inside the
+# visible window sit on the grid; rows outside it park just off-screen (above or
+# below), so scrolling animates the exiting row off one edge while the entering
+# row swishes in from the other. Parking below also keeps overflow rows from
+# peeking over the progress bar.
+func _scrolled_home(deck) -> Vector2:
+	var r  : int = roundi((deck.home_pos.y - GRID_START.y) / GRID_PITCH.y)
+	var rd : int = r - scroll_row
+	var y  : float
+	if rd < 0:
+		y = GRID_START.y - GRID_PITCH.y                  # just above the screen
+	elif rd >= VISIBLE_ROWS:
+		y = get_viewport_rect().size.y + 40.0            # just below the screen
+	else:
+		y = GRID_START.y + rd * GRID_PITCH.y
+	return Vector2(deck.home_pos.x, y)
 
 
 func _fan_pos(card) -> Vector2:
@@ -314,13 +386,60 @@ func _fan_pos(card) -> Vector2:
 	return Vector2(start_x + idx * spacing, FAN_CENTER_Y - CARD_SIZE / 2.0)
 
 
+# ── Queue geometry ────────────────────────────────────────────────────────────
+
+# 0 = current card, 1.. = position down the upcoming stack. playing_deck must
+# be non-null (every caller guards).
+func _queue_offset(card) -> int:
+	var n : int = playing_deck.cards.size()
+	var idx : int = playing_deck.cards.find(card)
+	return (idx - playing_index + n) % n
+
+
+func _queue_bottom_limit() -> float:
+	return get_viewport_rect().size.y - QUEUE_BOTTOM_PAD
+
+
+# The sliver gap, compressed so the whole queue fits above the progress bar,
+# but never thinner than QUEUE_GAP_MIN — past that the queue scrolls instead.
+func _queue_gap() -> float:
+	if playing_deck == null or playing_deck.cards.size() <= 1:
+		return PLAYER_QUEUE_GAP
+	var avail : float = _queue_bottom_limit() - PLAYER_SLOT_POS.y - CARD_SIZE
+	return clampf(avail / float(playing_deck.cards.size() - 1), QUEUE_GAP_MIN, PLAYER_QUEUE_GAP)
+
+
+# How many queued cards (q >= 1) the on-screen window holds.
+func _queue_visible_count() -> int:
+	if playing_deck == null:
+		return 0
+	var n : int = playing_deck.cards.size()
+	if _queue_gap() > QUEUE_GAP_MIN:
+		return n - 1        # compression alone fits the whole queue
+	var avail : float = _queue_bottom_limit() - PLAYER_SLOT_POS.y - CARD_SIZE
+	return maxi(int(avail / QUEUE_GAP_MIN), 0)
+
+
+func _queue_max_scroll() -> int:
+	if playing_deck == null:
+		return 0
+	return maxi(playing_deck.cards.size() - 1 - _queue_visible_count(), 0)
+
+
 func _player_queue_pos(card) -> Vector2:
 	if playing_deck == null:
 		return PLAYER_SLOT_POS
-	var n = playing_deck.cards.size()
-	var idx = playing_deck.cards.find(card)
-	var q = (idx - playing_index + n) % n
-	return PLAYER_SLOT_POS + Vector2(0, q * PLAYER_QUEUE_GAP)
+	var q : int = _queue_offset(card)
+	if q == 0:
+		return PLAYER_SLOT_POS
+	var qd : int = q - queue_scroll
+	if qd < 1:
+		# Scrolled past: parked just above the screen, up the queue column.
+		return Vector2(PLAYER_SLOT_POS.x, -CARD_SIZE - 40.0)
+	if qd > _queue_visible_count():
+		# Not yet in the window: parked just below the screen.
+		return Vector2(PLAYER_SLOT_POS.x, get_viewport_rect().size.y + 40.0)
+	return PLAYER_SLOT_POS + Vector2(0, qd * _queue_gap())
 
 
 func _compute_z(card) -> int:
@@ -366,7 +485,14 @@ func _card_visible(card) -> bool:
 		return true
 	if fanned_deck != null and deck == fanned_deck:
 		return true
-	return card == _home_top(deck)
+	if card != _home_top(deck):
+		return false
+	# Cull home stacks once they're (all but) fully off-screen — rows scrolled out
+	# of the grid window, or decks retracted for a fan. The slight shrink matters:
+	# the momentum easing only ever approaches the parked spot asymptotically, so
+	# without it a hair-thin sliver would keep hugging the screen edge forever.
+	var screen := Rect2(Vector2.ZERO, get_viewport_rect().size)
+	return _card_rect(card).grow(-2.0).intersects(screen)
 
 
 func _label_visible(card) -> bool:
@@ -380,8 +506,16 @@ func _label_visible(card) -> bool:
 	if fanned_deck != null and deck == fanned_deck:
 		return true
 	if fanned_deck == null and card == _home_top(deck):
-		return true
+		# Long wrapped titles overflow past the card's bottom edge, so a parked
+		# off-screen row could still poke text into view — show home labels only
+		# while their row is inside the scroll window.
+		return _row_in_view(deck)
 	return false
+
+
+func _row_in_view(deck) -> bool:
+	var r : int = roundi((deck.home_pos.y - GRID_START.y) / GRID_PITCH.y)
+	return r >= scroll_row and r < scroll_row + VISIBLE_ROWS
 
 
 func _label_text(card) -> String:
@@ -400,6 +534,10 @@ func _label_text(card) -> String:
 func _process(dt: float) -> void:
 	var mouse_pos := get_viewport().get_mouse_position()
 	_update_hover(mouse_pos)
+
+	# Let partial scroll input fade away so an old half-notch doesn't combine with
+	# a fresh one minutes later into an unexpected row shift.
+	_scroll_accum = move_toward(_scroll_accum, 0.0, SCROLL_DECAY * dt)
 
 	for card in all_cards:
 		if card.dragging:
@@ -426,6 +564,13 @@ func _process(dt: float) -> void:
 			i += 1
 
 	_refresh_background_if_changed()
+
+	# Keep the progress bar live while a song actually plays (or is being scrubbed)
+	# and the window is focused. Paused/stopped or in the background → no repaint,
+	# so the idle optimisation still holds when nobody's watching.
+	if _focused and _audio_player.stream != null \
+			and (_scrubbing or not _audio_player.stream_paused):
+		queue_redraw()
 
 
 # Repaint the background _draw only when one of the things it actually shows has
@@ -537,9 +682,127 @@ func _draw() -> void:
 		draw_line(Vector2(cx, cy - 22), Vector2(cx, cy + 22), border, 2.0)
 
 	if playing_deck != null:
-		var ph := Rect2(playing_deck.home_pos, Vector2(CARD_SIZE, CARD_SIZE))
+		var ph := Rect2(_scrolled_home(playing_deck), Vector2(CARD_SIZE, CARD_SIZE))
 		draw_rect(ph, Color(0, 0, 0, 0.04))
 		draw_rect(ph, Color(0.4, 0.5, 0.4, 0.4), false, 1.5)
+
+	_draw_progress_bar()
+
+
+# ── Progress bar ──────────────────────────────────────────────────────────────
+
+func _draw_progress_bar() -> void:
+	var card = _slot_occupant()
+	if card == null or _audio_player.stream == null:
+		return
+	var dur : float = _audio_player.stream.get_length()
+	if dur <= 0.0:
+		return
+	var pos : float = _display_pos()
+
+	var screen : Vector2 = get_viewport_rect().size
+	var yc : float = screen.y - BAR_BOTTOM_OFFSET
+	var x0 : float = BAR_MARGIN_X
+	var x1 : float = screen.x - BAR_MARGIN_X
+	var w  : float = x1 - x0
+
+	# Dark scrim across the bottom so bar + text stay legible over any wallpaper.
+	draw_rect(Rect2(0, screen.y - BOTTOM_BAND, screen.x, BOTTOM_BAND), Color(0, 0, 0, 0.32))
+
+	# One or more segments: a plain track is a single 0..dur segment; a chaptered
+	# track is one segment per chapter with a small gap between them.
+	var segs := _current_segments(card, dur)
+	var multi := segs.size() > 1
+	for i in segs.size():
+		var seg = segs[i]
+		var xa : float = x0 + (seg.start / dur) * w
+		var xb : float = x0 + (seg.end   / dur) * w
+		if multi:
+			if i > 0:            xa += CHAPTER_GAP * 0.5
+			if i < segs.size()-1: xb -= CHAPTER_GAP * 0.5
+		_draw_bar_piece(xa, xb, yc, TRACK_COLOR)
+		var frac : float = clampf((pos - seg.start) / maxf(seg.end - seg.start, 0.001), 0.0, 1.0)
+		if frac > 0.0:
+			_draw_bar_piece(xa, xa + (xb - xa) * frac, yc, FILL_COLOR)
+
+	# Playhead knob on the true (ungapped) timeline.
+	var px : float = x0 + clampf(pos / dur, 0.0, 1.0) * w
+	draw_circle(Vector2(px, yc), KNOB_RADIUS, Color.WHITE)
+
+	# Current chapter/track title (left) and elapsed / total time (right).
+	var font := ThemeDB.fallback_font
+	var ty : float = yc - 20.0
+	draw_string(font, Vector2(x0, ty), _current_title(card, pos, dur),
+		HORIZONTAL_ALIGNMENT_LEFT, w, 18, Color(1, 1, 1, 0.92))
+	draw_string(font, Vector2(x0, ty), _fmt_time(pos) + " / " + _fmt_time(dur),
+		HORIZONTAL_ALIGNMENT_RIGHT, w, 16, Color(1, 1, 1, 0.7))
+
+
+# A rounded (capsule-ended) horizontal bar piece from x=a to x=b, centred on yc.
+func _draw_bar_piece(a: float, b: float, yc: float, color: Color) -> void:
+	if b <= a:
+		return
+	var r : float = BAR_HEIGHT * 0.5
+	draw_rect(Rect2(a, yc - r, b - a, BAR_HEIGHT), color)
+	draw_circle(Vector2(a, yc), r, color)
+	draw_circle(Vector2(b, yc), r, color)
+
+
+# Segments in seconds for the current track. No chapters → a single full-length
+# segment. A trailing chapter with a null end falls back to the song duration.
+func _current_segments(card, dur: float) -> Array:
+	if card.chapters.is_empty():
+		return [{ "start": 0.0, "end": dur }]
+	var out := []
+	for ch in card.chapters:
+		var e = ch.get("end")
+		out.append({
+			"start": float(ch.get("start", 0.0)),
+			"end":   float(e) if e != null else dur,
+		})
+	return out
+
+
+func _current_title(card, pos: float, dur: float) -> String:
+	if card.chapters.is_empty():
+		return card.song_title
+	for ch in card.chapters:
+		var e = ch.get("end")
+		var ef : float = float(e) if e != null else dur
+		if pos >= float(ch.get("start", 0.0)) and pos < ef:
+			return String(ch.get("title", card.song_title))
+	return card.song_title
+
+
+func _display_pos() -> float:
+	if _scrubbing:
+		return _scrub_time
+	return _audio_player.get_playback_position()
+
+
+func _fmt_time(t: float) -> String:
+	var s := int(t)
+	return "%d:%02d" % [s / 60, s % 60]
+
+
+# The full-width band you can click/drag to seek, a bit taller than the bar line.
+func _bar_hit_rect() -> Rect2:
+	var screen : Vector2 = get_viewport_rect().size
+	var yc : float = screen.y - BAR_BOTTOM_OFFSET
+	return Rect2(
+		BAR_MARGIN_X - KNOB_RADIUS,
+		yc - BAR_HIT_HEIGHT * 0.5,
+		(screen.x - 2 * BAR_MARGIN_X) + KNOB_RADIUS * 2,
+		BAR_HIT_HEIGHT
+	)
+
+
+func _seek_time_from_x(x: float) -> float:
+	var screen : Vector2 = get_viewport_rect().size
+	var x0 : float = BAR_MARGIN_X
+	var w  : float = (screen.x - BAR_MARGIN_X) - x0
+	var dur : float = _audio_player.stream.get_length()
+	return clampf((x - x0) / w, 0.0, 1.0) * dur
 
 
 # ── Background wallpaper ──────────────────────────────────────────────────────
@@ -623,6 +886,12 @@ func _input(event: InputEvent) -> void:
 			DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_FULLSCREEN)
 		print("after change, mode: ", DisplayServer.window_get_mode())
 		return
+	if event is InputEventMouseButton and event.pressed \
+			and (event.button_index == MOUSE_BUTTON_WHEEL_DOWN
+				or event.button_index == MOUSE_BUTTON_WHEEL_UP):
+		var dir := 1.0 if event.button_index == MOUSE_BUTTON_WHEEL_DOWN else -1.0
+		_on_scroll(dir, event.factor if event.factor > 0.0 else 1.0)
+		return
 	if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
 		if event.pressed:
 			_on_press(event.position)
@@ -632,20 +901,68 @@ func _input(event: InputEvent) -> void:
 		_on_motion(event.position)
 
 
+# Accumulate wheel input; once it crosses the threshold, shift whichever thing
+# the mouse is pointing at — the queue column or the deck grid — by one step.
+# A direction flip clears what's built up, so wiggling never fights itself.
+func _on_scroll(dir: float, amount: float) -> void:
+	if fanned_deck != null:
+		return
+	if _scroll_accum != 0.0 and signf(_scroll_accum) != signf(dir):
+		_scroll_accum = 0.0
+	_scroll_accum += dir * amount
+	if absf(_scroll_accum) >= SCROLL_TICKS_PER_ROW:
+		var step := 1 if _scroll_accum > 0.0 else -1
+		if _over_queue():
+			_shift_queue(step)
+		else:
+			_shift_rows(step)
+		_scroll_accum = 0.0
+
+
+# Wheel context: only pointing at the queue stack itself scrolls the queue —
+# the card-width column of visible slivers, from just below the slot card down
+# to the bottom of the last visible queue card. Everywhere else, the grid.
+func _over_queue() -> bool:
+	if playing_deck == null:
+		return false
+	var vis : int = _queue_visible_count()
+	if vis < 1:
+		return false
+	var stack := Rect2(
+		PLAYER_SLOT_POS.x,
+		PLAYER_SLOT_POS.y + CARD_SIZE,
+		CARD_SIZE,
+		vis * _queue_gap()
+	)
+	return stack.has_point(get_viewport().get_mouse_position())
+
+
+func _shift_queue(dir: int) -> void:
+	queue_scroll = clampi(queue_scroll + dir, 0, _queue_max_scroll())
+
+
+func _shift_rows(dir: int) -> void:
+	var rows : int = ceili(decks.size() / float(GRID_COLS))
+	var new_row : int = clampi(scroll_row + dir, 0, maxi(rows - VISIBLE_ROWS, 0))
+	if new_row == scroll_row:
+		return
+	scroll_row = new_row
+	queue_redraw()   # the playing-deck home highlight moves with the grid
+
+
 func _update_hover(pos: Vector2) -> void:
 	if playing_deck == null:
 		hover_card = null
 		return
 
-	# Sticky: keep current hover while mouse is over its shifted rect OR its
-	# original queue strip. Prevents the card from sliding back the moment the
-	# cursor follows it left, and prevents oscillation when the shift exposes
-	# whatever card was beneath.
+	# Sticky: keep current hover while mouse is anywhere in the card's hover
+	# footprint — the popped-out rect, the corridor back to the queue, or its
+	# original strip. Prevents the card from sliding back the moment the cursor
+	# follows it left, and prevents oscillation when the shift exposes whatever
+	# card was beneath.
 	if hover_card != null and hover_card.deck == playing_deck \
 			and hover_card != playing_deck.cards[playing_index]:
-		if _card_rect(hover_card).has_point(pos):
-			return
-		if _queue_strip_rect(hover_card).has_point(pos):
+		if _hover_region_has(hover_card, pos):
 			return
 
 	var n : int = playing_deck.cards.size()
@@ -657,17 +974,35 @@ func _update_hover(pos: Vector2) -> void:
 	hover_card = null
 
 
+# A queued card's full hover footprint: its current (animating) rect, its
+# original visible sliver in the queue, and the full-height corridor between the
+# popped-out spot and the queue column. The corridor stays left of the queue's
+# x, so it never steals hover from the slivers of neighbouring queue cards.
+func _hover_region_has(card, pos: Vector2) -> bool:
+	if _card_rect(card).has_point(pos):
+		return true
+	if _queue_strip_rect(card).has_point(pos):
+		return true
+	var base : Vector2 = _player_queue_pos(card)
+	var corridor := Rect2(base + HOVER_OFFSET, Vector2(-HOVER_OFFSET.x, CARD_SIZE))
+	return corridor.has_point(pos)
+
+
 func _queue_strip_rect(card) -> Rect2:
-	# The 50px sliver at the bottom of each stacked queue card — the only part
-	# actually visible in the stack.
-	var n : int = playing_deck.cards.size()
-	var idx : int = playing_deck.cards.find(card)
-	var q : int = (idx - playing_index + n) % n
+	# The visible sliver at the bottom of each stacked queue card — its height is
+	# the (possibly compressed) gap. Cards outside the scroll window have no
+	# strip, so they can't be hovered until scrolled in. Deliberately derived
+	# from the un-nudged layout: the fisheye nudge is visual only, so hover
+	# detection never chases moving targets.
+	var qd : int = _queue_offset(card) - queue_scroll
+	if qd < 1 or qd > _queue_visible_count():
+		return Rect2()
+	var gap : float = _queue_gap()
 	return Rect2(
 		PLAYER_SLOT_POS.x,
-		PLAYER_SLOT_POS.y + q * PLAYER_QUEUE_GAP + (CARD_SIZE - PLAYER_QUEUE_GAP),
+		PLAYER_SLOT_POS.y + qd * gap + (CARD_SIZE - gap),
 		CARD_SIZE,
-		PLAYER_QUEUE_GAP,
+		gap,
 	)
 
 
@@ -682,6 +1017,26 @@ func _on_escape() -> void:
 
 
 func _on_press(pos: Vector2) -> void:
+	# Progress bar takes priority: if a song is loaded and you press on the bottom
+	# strip, start scrubbing instead of hitting a card.
+	if _slot_occupant() != null and _audio_player.stream != null \
+			and _bar_hit_rect().has_point(pos):
+		_scrubbing  = true
+		_scrub_time = _seek_time_from_x(pos.x)
+		_press_card = null
+		return
+
+	# A popped-out queue card owns its whole hover footprint: pressing anywhere
+	# in it (popped card, corridor, or its original sliver) targets that card —
+	# without this, its sliver would hit whatever card is stacked beneath, since
+	# the popped card's actual rect has left the queue.
+	if hover_card != null and _hover_region_has(hover_card, pos):
+		_press_card   = hover_card
+		_press_pos    = pos
+		_drag_active  = false
+		_press_region = ""
+		return
+
 	var sorted := all_cards.duplicate()
 	sorted.sort_custom(func(a, b): return a.z_index > b.z_index)
 
@@ -700,6 +1055,9 @@ func _on_press(pos: Vector2) -> void:
 
 
 func _on_motion(pos: Vector2) -> void:
+	if _scrubbing:
+		_scrub_time = _seek_time_from_x(pos.x)
+		return
 	if _press_card == null or _drag_active:
 		return
 	if pos.distance_to(_press_pos) < CLICK_THRESHOLD:
@@ -733,6 +1091,15 @@ func _on_motion(pos: Vector2) -> void:
 
 
 func _on_release(pos: Vector2) -> void:
+	# Finishing a scrub: commit the seek once, here — not on every drag frame, so
+	# the audio jumps a single time instead of stuttering. A plain click on the bar
+	# also lands here (press set _scrub_time, no motion needed).
+	if _scrubbing:
+		_scrubbing = false
+		_scrub_time = _seek_time_from_x(pos.x)
+		_audio_player.seek(_scrub_time)
+		return
+
 	# Finishing a spin: just stop steering it. The card keeps whatever spin
 	# momentum it had and coasts back to the idle rotation. This is not a click,
 	# so it must not toggle pause.
@@ -771,6 +1138,7 @@ func _handle_click(card) -> void:
 			_toggle_pause()
 		else:
 			playing_index = idx
+			queue_scroll = 0
 			_snap_descending(card)
 			_play_current()
 		return
@@ -847,6 +1215,7 @@ func _play_deck(deck, start_index: int) -> void:
 	fanned_deck  = null
 	playing_deck = deck
 	playing_index = start_index
+	queue_scroll = 0
 	_play_current()
 
 
@@ -872,6 +1241,7 @@ func _advance() -> void:
 	if playing_deck == null:
 		return
 	playing_index = (playing_index + 1) % playing_deck.cards.size()
+	queue_scroll = 0
 	_snap_descending(playing_deck.cards[playing_index])
 	_play_current()
 
@@ -895,6 +1265,7 @@ func _snap_descending(except_card) -> void:
 func _stop_deck() -> void:
 	playing_deck = null
 	playing_index = 0
+	queue_scroll = 0
 	_audio_player.stop()
 
 

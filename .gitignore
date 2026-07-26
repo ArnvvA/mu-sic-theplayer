@@ -6,6 +6,9 @@
 # Music files — downloaded locally via yt_downloader.py
 assets/music/
 
+# Python bytecode cache from yt_downloader.py
+__pycache__/
+
 # Claude Code memory
 .claude/
 

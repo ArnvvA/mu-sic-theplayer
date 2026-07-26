@@ -33,6 +33,7 @@ var card_size     := Vector2.ZERO
 
 var song_path       := ""
 var song_title      := ""
+var chapters        : Array = []  # [{start, end, title}] from meta.json; empty = none
 var deck                         = null  # reference to deck dict in main.gd
 
 
